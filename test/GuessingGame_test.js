@@ -378,4 +378,167 @@ describe("GuessingGame - Tests Unitaires Complets", function() {
         console.log("Securite - Protections validees");
         console.log("Invariants maintenus");
     });
+
+    // ============================================================
+// TEST DE LIVENESS - Parcours complet de tous les états
+// ============================================================
+describe("Liveness - Parcours complet de tous les états", function() {
+
+    it("Liveness : doit pouvoir atteindre chaque état depuis l'état initial", async function() {
+
+        // Déployer un contrat frais dédié à ce test
+        const GG = await GuessingGame.deploy();
+        await GG.waitForDeployment();
+
+        // --------------------------------------------------------
+        // ÉTAT 0 : UNINITIALISED
+        // Invariant : isInitialised == false
+        // --------------------------------------------------------
+        expect(await GG.isInitialised()).to.equal(false, "ÉTAT 0 : doit être non initialisé");
+
+        // Liveness bloquée : init sans ETH → reste en ÉTAT 0
+        await expect(
+            GG.connect(owner).initGame("secret1", { value: 0 })
+        ).to.be.revertedWith("Doit deposer des ETH");
+
+        // Liveness bloquée : init par non-owner → reste en ÉTAT 0
+        await expect(
+            GG.connect(player1).initGame("secret1", { value: ethers.parseEther("1") })
+        ).to.be.revertedWith("Seul owner peut initier");
+
+        // Liveness bloquée : giveToken avant init → impossible
+        await expect(
+            GG.connect(owner).giveToken(player1.address)
+        ).to.be.reverted;
+
+        // Liveness bloquée : guess avant init → impossible
+        await expect(
+            GG.connect(player1).guess("secret1", 100, "secret2")
+        ).to.be.revertedWith("Pas ton tour !");
+
+        // ✅ Transition ÉTAT 0 → ÉTAT 1
+        await GG.connect(owner).initGame("secret1", { value: ethers.parseEther("6") });
+
+        // --------------------------------------------------------
+        // ÉTAT 1 : INITIALISED, pas de tokenOwner
+        // Invariant : isInitialised == true, tokenOwner == address(0), amount == 6 ETH
+        // --------------------------------------------------------
+        expect(await GG.isInitialised()).to.equal(true,
+            "ÉTAT 1 : isInitialised doit être true");
+        expect(await GG.tokenOwner()).to.equal("0x0000000000000000000000000000000000000000",
+            "ÉTAT 1 : pas de tokenOwner");
+        expect(await GG.amount()).to.equal(ethers.parseEther("6"),
+            "ÉTAT 1 : amount doit valoir 6 ETH");
+
+        // Liveness bloquée : re-initialiser → impossible
+        await expect(
+            GG.connect(owner).initGame("secret1", { value: ethers.parseEther("1") })
+        ).to.be.revertedWith("Jeu deja initialise");
+
+        // Liveness bloquée : guess sans tokenOwner → impossible
+        await expect(
+            GG.connect(player1).guess("secret1", ethers.parseEther("1"), "secret2")
+        ).to.be.revertedWith("Pas ton tour !");
+
+        // Liveness bloquée : giveToken vers address(0) → impossible
+        await expect(
+            GG.connect(owner).giveToken("0x0000000000000000000000000000000000000000")
+        ).to.be.revertedWith("Adresse invalide");
+
+        // ✅ Transition ÉTAT 1 → ÉTAT 2
+        await GG.connect(owner).giveToken(player1.address);
+
+        // --------------------------------------------------------
+        // ÉTAT 2 : INITIALISED, token donné à player1
+        // Invariant : tokenOwner == player1
+        // --------------------------------------------------------
+        expect(await GG.tokenOwner()).to.equal(player1.address,
+            "ÉTAT 2 : tokenOwner doit être player1");
+
+        // Liveness bloquée : outsider ne peut pas guess
+        await expect(
+            GG.connect(player2).guess("secret1", ethers.parseEther("1"), "secret2")
+        ).to.be.revertedWith("Pas ton tour !");
+
+        // Liveness bloquée : montant 0 refusé
+        await expect(
+            GG.connect(player1).guess("secret1", 0, "secret2")
+        ).to.be.revertedWith("Montant > 0");
+
+        // Liveness bloquée : montant trop élevé refusé
+        await expect(
+            GG.connect(player1).guess("secret1", ethers.parseEther("99"), "secret2")
+        ).to.be.revertedWith("Pas assez de fonds");
+
+        // ✅ Transition ÉTAT 2 → ÉTAT 3 : guess() avec MAUVAIS secret
+        const amountAvant = await GG.amount();
+        await GG.connect(player1).guess("MAUVAIS", ethers.parseEther("1"), "secret2");
+
+        // --------------------------------------------------------
+        // ÉTAT 3 : guess raté — dernierguesser mis à jour, amount inchangé
+        // Invariant : dernierguesser == player1, amount intact, secretHash inchangé
+        // --------------------------------------------------------
+        expect(await GG.dernierguesser()).to.equal(player1.address,
+            "ÉTAT 3 : dernierguesser doit être player1");
+        expect(await GG.amount()).to.equal(amountAvant,
+            "ÉTAT 3 : amount ne doit pas changer après un mauvais guess");
+
+        // Liveness bloquée : player1 ne peut pas rejouer immédiatement
+        await expect(
+            GG.connect(player1).guess("secret1", ethers.parseEther("1"), "secret2")
+        ).to.be.revertedWith("Vous avez deja joue !");
+
+        // ✅ player1 passe le token à player2 pour débloquer
+        await GG.connect(player1).giveToken(player2.address);
+        expect(await GG.tokenOwner()).to.equal(player2.address,
+            "player2 doit être le nouveau tokenOwner");
+
+        // ✅ Transition ÉTAT 3 → ÉTAT 4 : guess() avec BON secret par player2
+        const amountAvantGain = await GG.amount();
+        const secretHashAvant = await GG.secretHash();
+        await GG.connect(player2).guess("secret1", ethers.parseEther("2"), "secret2");
+
+        // --------------------------------------------------------
+        // ÉTAT 4 : guess réussi — amount réduit, secretHash changé
+        // Invariant : amount == amountAvantGain - 2 ETH, secretHash == keccak256("secret2")
+        // --------------------------------------------------------
+        const amountApresGain = await GG.amount();
+        const secretHashApres = await GG.secretHash();
+        const expectedHash    = ethers.keccak256(ethers.toUtf8Bytes("secret2"));
+
+        expect(amountApresGain).to.equal(
+            amountAvantGain - ethers.parseEther("2"),
+            "ÉTAT 4 : amount doit diminuer du gain"
+        );
+        expect(secretHashApres).to.equal(expectedHash,
+            "ÉTAT 4 : secretHash doit correspondre au nouveau secret");
+        expect(secretHashApres).to.not.equal(secretHashAvant,
+            "ÉTAT 4 : le secretHash doit avoir changé");
+        expect(await GG.isInitialised()).to.equal(true,
+            "ÉTAT 4 : isInitialised reste toujours true");
+
+        // ✅ player3 vide complètement le contrat → ÉTAT FINAL
+        await GG.connect(player2).giveToken(player3.address);
+        const amountRestant = await GG.amount();
+        await GG.connect(player3).guess("secret2", amountRestant, "fin");
+
+        // --------------------------------------------------------
+        // ÉTAT FINAL : amount == 0, tokenOwner == address(0)
+        // Invariant : plus personne ne peut jouer
+        // --------------------------------------------------------
+        expect(await GG.amount()).to.equal(0,
+            "ÉTAT FINAL : amount doit être 0");
+        expect(await GG.tokenOwner()).to.equal("0x0000000000000000000000000000000000000000",
+            "ÉTAT FINAL : tokenOwner doit être réinitialisé à address(0)");
+
+        // Liveness bloquée : jeu terminé, plus personne ne peut guess
+        await expect(
+            GG.connect(player3).guess("fin", 100, "autre")
+        ).to.be.revertedWith("Pas ton tour !");
+
+        console.log("\n✅ Liveness confirmée : tous les états ont été atteints et validés.");
+    });
 });
+    
+});
+
